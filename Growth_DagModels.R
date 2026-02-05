@@ -173,3 +173,121 @@ gby<-gby + labs(tag = "b")
 
 ggsave(gby,filename =paste(myplots,"/",df_name,"_growth_model_estimates.png",sep = ""), dpi=300, width = 3, height = 3.5)
 
+
+##--------------------
+##TAXA-specific models
+##--------------------
+mytaxa<-c("Acropora","Pocillopora","Stylophora","Seriatopora","Others")
+## Stylophora has few obs (15), Seri(24): problematic model
+
+
+# Store results in a list
+model_taxa <- list()
+posterior_taxa <- list()
+
+for (tx in mytaxa) {
+  
+  taxa.sub<-finalmodel[finalmodel$Ctype==tx,]
+  
+  for (model_name in names(mymodels)) {
+    predictors <- mymodels[[model_name]]
+    
+    formula_str <- paste("growth ~", paste(predictors, collapse = " + "), 
+                         "+ size + Days + 
+                        (1 |SiteQ/UniqueID)")
+    model_formula <- as.formula(formula_str)
+    
+    fit <- brm(
+      formula = model_formula,
+      data = taxa.sub,
+      family = Gamma(link="log"),
+      sample_prior = "yes",
+      #prior = prior_suggestions,
+      prior = c(
+        prior(normal(0, 1.5), class = "b"),
+        prior(normal(0, 1), class = "sd"),
+        prior(gamma(4, 0.5), class = "shape")
+      ),
+      chains = 4, cores = 4, iter = 6000, warmup = 2000,
+      control = list(adapt_delta = 0.999,max_treedepth = 20),
+      silent = TRUE, refresh = 0,
+      save_pars = save_pars(all = TRUE)
+    )
+    
+    # Save the fitted model
+    model_taxa[[paste(tx, model_name, sep = "_")]] <- fit
+    
+    taxa.draws <- as_draws_df(fit)
+    mypred<-names(taxa.draws)[2]
+    
+    taxa.summary<-dplyr::tibble(term=mypred,
+                                estimate=mean(taxa.draws[[mypred]]),
+                                lower_95 = quantile(taxa.draws[[mypred]], 0.025),
+                                upper_95 = quantile(taxa.draws[[mypred]], 0.975),
+                                lower_50 = quantile(taxa.draws[[mypred]], 0.25),
+                                upper_50 = quantile(taxa.draws[[mypred]], 0.75),
+                                prob.dir = mean (taxa.draws[[mypred]] < 0))%>%
+      mutate(taxa=tx,model=model_name)
+    
+    posterior_taxa[[paste(tx, model_name, mypred, sep = "_")]] <- taxa.summary
+  }
+  
+}
+# Combine all results into a data frame
+taxa_estimates <- bind_rows(posterior_taxa)
+taxa_estimates$term<-gsub("^b_","",taxa_estimates$term )
+taxa_estimates$term<-tools::toTitleCase(taxa_estimates$term)
+
+taxa_estimates$term <- factor(taxa_estimates$term, levels = myorder)
+
+taxa_estimates <- taxa_estimates %>%
+  mutate(effect_type = case_when(
+    prob.dir > 0.975 ~ "negative",
+    prob.dir < 0.025 ~ "positive",
+    TRUE  ~ "uncertain"
+  ))
+
+
+taxa.shape=c(24,22,21,25,8)
+
+taxa.gr<-taxa_estimates%>% 
+  filter (!taxa %in% c("Seriatopora","Stylophora"))%>%droplevels()%>%
+  ggplot(aes(x=estimate,y = term, colour=prob.dir,fill=prob.dir, shape=taxa)) +
+  geom_pointrange(aes(xmin = lower_50, xmax = upper_50), linewidth = 1, color = "gray20",
+                  position = position_dodge(width = 0.5)) +
+  geom_pointrange(aes(xmin = lower_95, xmax = upper_95), linewidth = 0.1, color = "gray40",
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(position = position_dodge(width = 0.5)) + guides(fill = "none", colour = "none")+
+  scale_colour_gradient2(
+    low = "#0072B2",     # blue (low P < 0 = positive)
+    mid = "gray70",      # uncertain
+    high = "#D90E00",    # red (high P < 0 = negative)
+    midpoint = 0.5,
+    limits = c(0, 1)
+  ) + 
+  scale_fill_gradient2(
+    low = "#0072B2",     
+    mid = "gray70",      
+    high = "#D90E00",   
+    midpoint = 0.5,
+    limits = c(0, 1)
+  )+
+  scale_shape_manual(values = rev(taxa.shape))+
+  ggtitle("Growth")+
+  labs(x = "Posterior mean", y = "") +
+  theme_minimal()+
+  theme(legend.position="inside",legend.position.inside = c(0.8, 0.2), legend.title = element_blank(),
+        legend.text = element_text(size=6), legend.key.size = unit(0.4, "cm"),
+        title = element_text(size=8))+
+  theme(
+    panel.grid.major = element_line(colour = "grey98"),
+    panel.grid.minor = element_line(colour = "grey98")
+  )
+
+#-----------------------------------------------------------------------------------------------------------------
+save(rawdata, mymodels, finalmodel, model_taxa, posterior_taxa, taxa_estimates, file = "Growth_taxa_models.RData")
+#-----------------------------------------------------------------------------------------------------------------
+
+table.estimates=taxa_estimates%>%dplyr::select(taxa, term, estimate,lower_95,upper_95,lower_50,upper_50)%>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
