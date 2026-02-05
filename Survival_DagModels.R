@@ -224,3 +224,144 @@ ggsave(
   filename = file.path(myplots, paste0(df_name, "_survival_model_estimates.png")),
   plot = sby, dpi = 300, width = 3, height = 3.5
 )
+
+
+##--------------------
+##TAXA-specific models
+##--------------------
+
+mytaxa<-c("Acropora","Pocillopora","Stylophora","Seriatopora","Others")
+## Acro, Poci and Others (n=> 111 each)
+
+# Store results in a list
+model_taxa <- list()
+posterior_taxa <- list()
+
+for (tx in mytaxa) {
+  
+  taxa.sub<-finalmodel[finalmodel$Ctype==tx,]
+  
+  for (model_name in names(mymodels)) {
+    predictors <- mymodels[[model_name]]
+    
+    # Dynamically build the formula
+    formula_str <- paste("survival ~", paste(predictors, collapse = " + "), 
+                         "+ size + Days + 
+                       (1 |SiteQ/UniqueID)")
+    
+    model_formula <- as.formula(formula_str)
+    
+    fit <- brm(
+      formula = model_formula,
+      data = taxa.sub,
+      family = bernoulli(link = "logit"),
+      prior = c(
+        prior(normal(0, 2.5), class = "b"),         # loose Prior for scaled fixed effects due to strong covariates like size
+        prior(normal(0, 1), class = "sd"),        # Priors for random effects (group-level SDs)
+        prior(normal(2.28, 1.5), class = "Intercept") # informed by the large prop. of 1's 
+      ),
+      chains = 4, cores = 4, iter = 5000, warmup = 1000,
+      control = list(adapt_delta = 0.999,max_treedepth = 20),
+      silent = TRUE, refresh = 0
+    )
+    
+    # Save the fitted model
+    model_taxa[[paste(tx, model_name, sep = "_")]] <- fit
+    
+    taxa.draws <- as_draws_df(fit)
+    mypred<-names(taxa.draws)[2]
+    
+    taxa.summary<-dplyr::tibble(term=mypred,
+                                estimate=exp(mean(taxa.draws[[mypred]])),##odds-ratio
+                                lower_95 = exp(quantile(taxa.draws[[mypred]], 0.025)),
+                                upper_95 = exp(quantile(taxa.draws[[mypred]], 0.975)),
+                                lower_50 = exp(quantile(taxa.draws[[mypred]], 0.25)),
+                                upper_50 = exp(quantile(taxa.draws[[mypred]], 0.75)),
+                                prob.dir = mean(taxa.draws[[mypred]] < 0))%>%
+      mutate(taxa=tx,model=model_name)
+    #mutate(taxa=tx)
+    posterior_taxa[[paste(tx, model_name, mypred, sep = "_")]] <- taxa.summary
+    #posterior_taxa[[paste(tx)]] <- taxa.summary
+  }
+  
+}
+# Combine all results into a data frame
+taxa_estimates <- bind_rows(posterior_taxa)
+taxa_estimates$term<-gsub("^b_","",taxa_estimates$term)
+taxa_estimates$term<-tools::toTitleCase(taxa_estimates$term)
+
+myorder<-c("Overgrowth","Turf","Temp","Light","Currents", "Tides")
+taxa_estimates$term <- factor(taxa_estimates$term, levels = myorder)
+
+taxa.shape=c(24,22,21,25,8)
+taxa_estimates$taxa <- factor(taxa_estimates$taxa,levels = unique(taxa_estimates$taxa))
+
+
+taxa_estimates <- taxa_estimates %>%
+  mutate(effect_type = case_when(
+    prob.dir > 0.975 ~ "negative",
+    prob.dir < 0.025 ~ "positive",
+    TRUE  ~ "uncertain"
+  ))%>%
+  mutate(percentchange = (estimate-1)*100)
+
+
+##function to edit axes for nicer plot
+custom_labels <- function(breaks) {
+  sapply(breaks, function(x) {
+    if (x == 0.1) {
+      "0.1"  # Keep one decimal for 0.1
+    } else {
+      format(x, scientific = FALSE, trim = TRUE)  # No decimals for others
+    }
+  })
+}
+
+subset.taxa<-taxa_estimates%>%dplyr::filter(!(taxa %in% c("Seriatopora","Stylophora")))%>%droplevels()
+
+taxa.surv<-
+  ggplot(subset.taxa, aes(x=estimate,y = term, colour=prob.dir,fill=prob.dir, shape=taxa)) +
+  geom_pointrange(aes(xmin = lower_50, xmax = upper_50), linewidth = 1, color = "gray20",
+                  position = position_dodge(width = 0.5)) +
+  geom_pointrange(aes(xmin = lower_95, xmax = upper_95), linewidth = 0.2, color = "gray40",
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_point(position = position_dodge(width = 0.5)) + guides(fill = "none", colour = "none")+
+  scale_colour_gradient2(
+    low = "#0072B2",     # blue (low P < 0 = positive)
+    mid = "gray70",      # uncertain
+    high = "#D90E00",    # red (high P < 0 = negative)
+    midpoint = 0.5,
+    limits = c(0, 1)
+  ) + 
+  scale_fill_gradient2(
+    low = "#0072B2",     
+    mid = "gray70",      
+    high = "#D90E00",   
+    midpoint = 0.5,
+    limits = c(0, 1)
+  )+
+  scale_x_log10(labels = custom_labels,breaks=c(0.01,0.1,1,10))+
+  scale_shape_manual(values = rev(taxa.shape))+
+  ggtitle("Survival")+
+  labs(x = "Posterior Log-Odds ratio", y = "") +
+  theme_minimal()+
+  theme(legend.position="none",legend.position.inside = c(0.7, 0.2), legend.title = element_blank(),
+        legend.text = element_text(size=6), legend.key.size = unit(0.4, "cm"),
+        title = element_text(size=8))+
+  theme(
+    panel.grid.major = element_line(colour = "grey98"),
+    panel.grid.minor = element_line(colour = "grey98")
+  )
+
+
+##Edit and save table
+table.estimates=taxa_estimates%>%dplyr::select(taxa, term, estimate,lower_95,upper_95,lower_50,upper_50)%>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+
+#-----------------------------------------------------------------------------------------------------------------
+save(rawdata, mymodels, finalmodel, model_taxa, posterior_taxa, taxa_estimates, file = "Survival_taxa_models.RData")
+#-----------------------------------------------------------------------------------------------------------------
+
+
